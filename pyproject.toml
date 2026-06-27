@@ -1,0 +1,25 @@
+[project]
+name = "nn-enrichment3d"
+version = "0.1.0"
+description = "Neural-network-enriched RKPM (NN-RKPM / NN-PU) for 3D bimaterial elasticity, PyTorch port"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+# JAX backend (nnpu_jax.py). Kept as an extra so the proven torch deps stay untouched:
+#   uv sync --extra jax        # CPU jax  -- local dev, smoke + numerical-agreement checks
+#   uv sync --extra jax-cuda   # GPU jax  -- on the cluster gpu partition (A100, sm_80+)
+# If torch-cu130 and jax-cuda NVIDIA libs ever clash in one venv, build a separate .venv-jax.
+jax = ["jax>=0.4.35", "optax>=0.2.4"]
+jax-cuda = ["jax[cuda12]>=0.4.35", "optax>=0.2.4"]
+
+[tool.uv]
+# The default PyPI torch wheels for linux x86_64 are CUDA-enabled (cu12x),
+# which works on the cluster's V100S and A100 GPUs as well as on CPU.
