@@ -3,9 +3,14 @@ name = "nn-enrichment3d"
 version = "0.1.0"
 description = "Neural-network-enriched RKPM (NN-RKPM / NN-PU) for 3D bimaterial elasticity, PyTorch port"
 readme = "README.md"
-requires-python = ">=3.10"
+# pinned to 3.13: the rocm6.3 torch index doesn't carry wheels for every 3.10+ interpreter,
+# which breaks uv's universal resolution under a looser bound
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "torch>=2.6",
+    # torch(+rocm)'s transitive dep, published only on the pytorch rocm index; declared
+    # directly because tool.uv.sources only maps direct dependencies to that index
+    "pytorch-triton-rocm>=3.3",
     "numpy>=1.26",
     "pandas>=2.0",
     "matplotlib>=3.7",
@@ -14,12 +19,26 @@ dependencies = [
 
 [project.optional-dependencies]
 # JAX backend (nnpu_jax.py). Kept as an extra so the proven torch deps stay untouched:
-#   uv sync --extra jax        # CPU jax  -- local dev, smoke + numerical-agreement checks
-#   uv sync --extra jax-cuda   # GPU jax  -- on the cluster gpu partition (A100, sm_80+)
-# If torch-cu130 and jax-cuda NVIDIA libs ever clash in one venv, build a separate .venv-jax.
+#   uv sync --extra jax        # CPU jax -- smoke + numerical-agreement checks vs torch
+# JAX on the MI300A GPUs is a FUTURE TASK: it needs AMD's jax-rocm plugin wheels
+# (https://github.com/ROCm/jax), which are versioned separately from upstream jax and
+# not published on PyPI for rocm6.3 in a form uv can resolve here. Until then the JAX
+# backend is CPU-only on Cosmos.
 jax = ["jax>=0.4.35", "optax>=0.2.4"]
-jax-cuda = ["jax[cuda12]>=0.4.35", "optax>=0.2.4"]
 
 [tool.uv]
-# The default PyPI torch wheels for linux x86_64 are CUDA-enabled (cu12x),
-# which works on the cluster's V100S and A100 GPUs as well as on CPU.
+# Cosmos (SDSC) nodes are AMD MI300A APUs (gfx942, ROCm 6.3). The ROCm torch wheels
+# expose HIP through the torch.cuda API, so no source changes are needed -- only the
+# wheel index below. The same wheels run fine CPU-only (login node, --device cpu).
+# The rocm index only ships linux_x86_64 wheels, so restrict universal resolution:
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.3"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-rocm" }
+# torch's transitive dep, published only on the pytorch rocm index
+pytorch-triton-rocm = { index = "pytorch-rocm" }

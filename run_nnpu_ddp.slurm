@@ -5,29 +5,31 @@
 #SBATCH --time=04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=96
+#SBATCH --exclusive
 
-# Multi-GPU (distributed) NN-RKPM training.
+# Multi-GPU (distributed) NN-RKPM training on Cosmos (SDSC).
 #
 # This is domain-decomposition data-parallelism, not sample-parallel DDP: the integration
 # cells are split across ranks and gradients are SUM all-reduced (see nnpu_torch.py /
-# distributed.py / partition.py). Each rank == one GPU. Keep --gres=gpu:N == --nproc_per_node=N.
+# distributed.py / partition.py). Each rank == one MI300A APU. Nodes are exclusive with
+# 4 APUs (SPX mode = 4 visible GPUs), so --nproc_per_node=4. The "nccl" backend string
+# maps to RCCL on ROCm -- no code change.
 #
-# Worth it only for large meshes (millions of integration points); for the bundled 2662-cell
-# demo a single process is faster. Use it to validate scaling and as the template to grow on.
+# Worth it only for large meshes (millions of integration points); for the bundled
+# 2662-cell demo a single process is faster. Use it to validate scaling and as the
+# template to grow on.
 
-cd /scratch/gpfs/nc1514/NN-enrichment3D
+cd /cosmos/vast/scratch/nchen9/NN-enrichment3D
 
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export OMP_NUM_THREADS=$(( ${SLURM_CPUS_PER_TASK:-96} / 4 ))
 export PYTHONUNBUFFERED=1
-NGPU=$(echo "$SLURM_GPUS_ON_NODE" | grep -oE '[0-9]+' | head -1); NGPU=${NGPU:-2}
+NGPU=4
 
 echo "host=$(hostname) gpus=${NGPU} job=${SLURM_JOB_ID}"
-nvidia-smi -L 2>/dev/null || true
+/opt/rocm/bin/rocm-smi --showproductname 2>/dev/null || true
 
-# --- single node, NGPU GPUs (NCCL chosen automatically on GPU) ---
+# --- single node, 4 APUs (RCCL chosen automatically via the "nccl" backend) ---
 srun .venv/bin/torchrun --standalone --nproc_per_node="${NGPU}" \
     nnpu_torch.py --device cuda
     # add --smoke for a quick validation run
@@ -40,11 +42,8 @@ srun .venv/bin/torchrun --standalone --nproc_per_node="${NGPU}" \
 #     --rdzv_id="$SLURM_JOB_ID" --rdzv_backend=c10d --rdzv_endpoint="${head_ip}:29500" \
 #     nnpu_torch.py --device cuda
 
-# --- SDSC Expanse notes ---
-#   #SBATCH --partition=gpu-shared      (or gpu);  #SBATCH --account=<alloc>
-#   module load gpu; module load slurm
-#   Expanse GPUs are V100 (sm_70). The repo's torch 2.12+cu130 wheel DROPPED sm_70, so build
-#   the venv there against a cu12x wheel, e.g.:
-#     uv pip install torch --index-url https://download.pytorch.org/whl/cu124
-# --- Princeton Della notes ---
-#   #SBATCH --account=kolemen ;  A100/H200 (sm_80/sm_90) work with the default cu130 wheel.
+# --- Cosmos notes ---
+#   * TPX-mode nodes (#SBATCH --res=tpx) split each APU into 3 logical GPUs, giving
+#     12 devices/node -- bump NGPU/--nproc_per_node to 12 if you use that reservation.
+#   * HSA_XNACK=1 (unified-memory page migration) is a future optimization to explore;
+#     the MI300A shares physical memory between CPU and GPU.

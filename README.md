@@ -34,12 +34,15 @@ Method** with **SCNI** (Stabilized Conforming Nodal Integration):
 
 ## Setup
 
-The environment is managed by [uv](https://docs.astral.sh/uv/) (Python 3.13, PyTorch with bundled CUDA):
+The environment is managed by [uv](https://docs.astral.sh/uv/) (Python 3.13). On Cosmos (SDSC,
+AMD MI300A APUs) torch resolves from the ROCm 6.3 wheel index (`[tool.uv.index]` in
+`pyproject.toml`); ROCm torch exposes HIP through the `torch.cuda` API, so `--device cuda` and
+the `nccl` backend string (→ RCCL) work unchanged on AMD.
 
 ```bash
-uv sync                  # torch backend: torch, numpy, pandas, matplotlib, scipy
-uv sync --extra jax      # + JAX backend on CPU (local dev / validation)
-uv sync --extra jax-cuda # + JAX backend on GPU nodes (jax[cuda12], A100/H100)
+uv sync                  # torch backend: torch+rocm6.3, numpy, pandas, matplotlib, scipy
+uv sync --extra jax      # + JAX backend on CPU (validation / backend comparison)
+# JAX on the MI300A GPUs is a FUTURE TASK (needs AMD's jax-rocm plugin wheels; see pyproject.toml)
 ```
 
 ## Run
@@ -52,8 +55,9 @@ uv run python nnpu_torch.py --smoke --out-dir /tmp/nnpu_smoke
 uv run python nnpu_torch.py                 # auto-selects CUDA if available, else CPU
 uv run python nnpu_torch.py --device cpu    # force CPU
 
-# on the cluster (CPU on the general partition; schedules immediately)
-sbatch run_nnpu.slurm
+# on the cluster (whole exclusive node: 4x MI300A APUs, 96 CPU cores)
+sbatch run_nnpu.slurm       # CPU
+sbatch run_nnpu_gpu.slurm   # single MI300A
 ```
 
 Key flags: `--epochs-rk`, `--epochs-nnrk`, `--lbfgs-iters`, `--lr-rk`, `--lr-nnrk`,
@@ -77,8 +81,12 @@ three backends (TensorFlow / PyTorch / JAX) can be benchmarked head to head. Sam
 ```bash
 uv run --extra jax python nnpu_jax.py --smoke --device cpu --out-dir /tmp/jx_smoke   # ~30 s
 uv run --extra jax python nnpu_jax.py --device cpu                                   # full CPU run
-sbatch run_nnpu_jax_gpu.slurm                                                        # single GPU
+sbatch run_nnpu_jax.slurm                                                            # CPU, on the cluster
 ```
+
+JAX on the Cosmos GPUs is not wired up yet (future task; needs AMD's
+[jax-rocm](https://github.com/ROCm/jax) plugin wheels) — `run_nnpu_jax_{gpu,ddp}.slurm` fail fast
+with a pointer until then.
 
 JAX specifics: `float64` via `jax_enable_x64`; parameters are a plain pytree driven by Optax;
 sparse operators are `jax.experimental.sparse` BCOO (`--dense` switches to dense for a perf
@@ -110,8 +118,8 @@ Launch with `torchrun`; the script auto-detects the distributed environment (sin
 run without `torchrun`). Identical seeds across ranks keep the replicas in sync.
 
 ```bash
-# 2 GPUs on one node
-torchrun --standalone --nproc_per_node=2 nnpu_torch.py --device cuda
+# all 4 MI300A APUs on one node
+torchrun --standalone --nproc_per_node=4 nnpu_torch.py --device cuda
 
 # correctness check on CPU (no GPUs needed): must match the single-process result
 python  nnpu_torch.py --smoke --device cpu --out-dir /tmp/r1
@@ -124,9 +132,8 @@ sbatch run_nnpu_ddp.slurm
 
 It pays off only at large meshes (millions of integration points), where per-GPU compute (~1/N)
 dwarfs the tiny fixed-size gradient all-reduce; for the bundled 2662-cell demo a single process is
-faster. Note: the repo's `torch 2.12+cu130` targets newer NVIDIA GPUs (A100/H100, sm_80+); on
-older cards such as Expanse's V100 (sm_70), build the venv against a cu12x wheel (see
-`run_nnpu_ddp.slurm`).
+faster. Note: the repo's torch is a ROCm 6.3 wheel targeting the MI300A (gfx942); the `nccl`
+backend string maps to RCCL on ROCm, so no code changes vs. NVIDIA.
 
 **JAX (`run_nnpu_jax_ddp.slurm`)** uses the same domain-decomposition *semantics* (cells
 partitioned, energies SUM-combined) but a different *mechanism*: a **single process** sees all GPUs
@@ -146,6 +153,33 @@ GPU; auto-detects SLURM) — see the commented block in the script.
 - `loss_{rk,nnrk,lbfgs}.txt`, `loss_history.png`, and z=0 slice PNGs of displacement/stress/strain/enrichment.
 - `timings_{torch,jax}.txt` — per-stage + total wall time `[adam_rk, adam_nnrk, lbfgs, total]` (consumed by `compare_backends.py`).
 - The JAX backend writes the same files; its checkpoint is `Final/LBFGS/NNRK_checkpoint.pkl` (pickled NumPy) rather than `.pt`.
+
+## Cosmos cluster (SDSC)
+
+The repo runs on [Cosmos](https://www.sdsc.edu) — HPE Cray EX2500, 42 nodes × 4 AMD MI300A APUs
+(gfx942), ROCm 6.3 at `/opt/rocm`, SLURM. Practicalities:
+
+- Single `cluster` partition, **exclusive whole-node allocation** — every job gets 4 APUs +
+  96 Zen4 cores, so there is no CPU-vs-GPU queue tradeoff; use whichever fits the run.
+- Repo + runs live on VAST scratch (`/cosmos/vast/scratch/$USER/...`) per cluster policy; the
+  NFS home has a 100 GB quota and is for source/small files only.
+- The login nodes are compute-restricted — validate with `sbatch` smoke jobs, not login-node runs.
+- The default APU mode is SPX (4 visible GPUs/node); 6 reserved nodes run TPX
+  (`#SBATCH --res=tpx`, 12 logical GPUs/node) — see `run_nnpu_ddp.slurm`.
+
+**Future work on Cosmos** (deliberately not done in the compatibility port):
+
+- **Unified CPU–GPU memory**: the MI300A shares physical memory between CPU and GPU.
+  `HSA_XNACK=1` enables page migration so host/device copies (e.g. the `.dat` load → `to(device)`
+  path, and the CPU-side result assembly) could be skipped entirely. Needs profiling before use.
+- **TPX partitioning**: 12 logical GPUs/node for finer domain decomposition on large meshes.
+- **JAX on ROCm**: wire AMD's [jax-rocm](https://github.com/ROCm/jax) plugin wheels into
+  `pyproject.toml` and re-enable `run_nnpu_jax_{gpu,ddp}.slurm`.
+- **Singularity containerization**: package the environment as a `.sif` image (Cosmos supports
+  Singularity via `module load singularitypro`; AMD publishes ROCm PyTorch base images on the
+  [Infinity Hub](https://www.amd.com/en/developer/resources/infinity-hub.html)). Run with
+  `singularity exec --rocm --bind /cosmos/vast/scratch/$USER:/workspace <image>.sif ...` —
+  makes the venv reproducible and portable across ROCm upgrades.
 
 ## Notes on the port
 
